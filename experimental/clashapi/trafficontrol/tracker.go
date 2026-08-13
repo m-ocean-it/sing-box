@@ -118,6 +118,7 @@ func (tt *TCPConn) WriterReplaceable() bool {
 	return true
 }
 
+// TODO(mmotyshen): Might something like this be useful?
 func NewTCPTracker(conn net.Conn, manager *Manager, metadata adapter.InboundContext, outboundManager adapter.OutboundManager, matchRule adapter.Rule, matchOutbound adapter.Outbound) *TCPConn {
 	id, _ := uuid.NewV4()
 	var (

@@ -1,6 +1,6 @@
 {
   "log": {
-    "level": "info"
+    "level": "debug"
   },
   "dns": {
     "servers": [
@@ -13,28 +13,54 @@
   },
   "inbounds": [
     {
-      "type": "shadowsocks",
-      "listen": "::",
-      "listen_port": 8080,
-      "network": "tcp",
-      "method": "2022-blake3-aes-128-gcm",
-      "password": "Gn1JUS14bLUHgv1cWDDp4A==",
-      "multiplex": {
-        "enabled": true,
-        "padding": true
-      }
+      "type": "mixed",
+      "tag": "mixed-in",
+      "users": [
+        {
+          "username": "username",
+          "password": "password"
+        }
+      ],
+      "listen": "0.0.0.0",
+      "listen_port": 9090
     }
   ],
   "outbounds": [
     {
-      "type": "direct"
+      "type": "direct",
+      "tag": "direct-out"
+    },
+    {
+      "type": "socks",
+      "tag": "socks-out",
+      "server": "127.0.0.1",
+      "server_port": 1080
+    },
+    // {
+    //   "type": "urltest",
+    //   "tag": "auto-out",
+    //   "outbounds": ["direct-out", "socks-out"],
+    //   "url": "",
+    //   "interval": "1m",
+    //   "tolerance": 50,
+    //   "idle_timeout": "5m",
+    //   "interrupt_exist_connections": false
+    // }
+    {
+      "type": "smart",
+      "tag": "auto-out",
+      "outbounds": ["direct-out", "socks-out"],
+      "required_success_rate": "1m",
+      "recheck_interval": "3m",
+      "request_sample_count": 10,
+      "required_request_sample_count": 0
     }
   ],
   "route": {
     "rules": [
       {
-        "port": 53,
-        "action": "hijack-dns"
+        "inbound": "mixed-in",
+        "outbound": "auto-out"
       }
     ]
   }

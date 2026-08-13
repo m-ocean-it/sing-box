@@ -14,7 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/sniff"
-	"github.com/sagernet/sing-box/common/tlsfragment"
+	tf "github.com/sagernet/sing-box/common/tlsfragment"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -138,6 +138,11 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		return
 	}
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
+
+	// TODO(mmotyshen): Here, the first byte from a node is recevied. Perhaps, this is the exact place where I need
+	// to track the delay of a given node. Maybe, I can pass an additional closure to `connectionCopy` and/or wrap
+	// the `onClose` closure to check whether a given connection successfully receives at least a byte from the
+	// corresponding outbound plus how much time it took.
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
 }
 

@@ -19,10 +19,11 @@ import (
 )
 
 var (
-	bucketSelected = []byte("selected")
-	bucketExpand   = []byte("group_expand")
-	bucketMode     = []byte("clash_mode")
-	bucketRuleSet  = []byte("rule_set")
+	bucketSelected     = []byte("selected")
+	bucketExpand       = []byte("group_expand")
+	bucketMode         = []byte("clash_mode")
+	bucketRuleSet      = []byte("rule_set")
+	bucketSmartRouting = []byte("smart_routing")
 
 	bucketNameList = []string{
 		string(bucketSelected),
@@ -30,6 +31,7 @@ var (
 		string(bucketMode),
 		string(bucketRuleSet),
 		string(bucketRDRC),
+		string(bucketSmartRouting),
 	}
 
 	cacheIDDefault = []byte("default")

@@ -14,7 +14,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-tun"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -95,12 +95,7 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
-	}
-	return ""
+	return s.group.Now()
 }
 
 func (s *URLTest) All() []string {
@@ -331,6 +326,15 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		return nil, false
 	}
 	return minOutbound, true
+}
+
+func (g *URLTestGroup) Now() string {
+	if g.selectedOutboundTCP != nil {
+		return g.selectedOutboundTCP.Tag()
+	} else if g.selectedOutboundUDP != nil {
+		return g.selectedOutboundUDP.Tag()
+	}
+	return ""
 }
 
 func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {

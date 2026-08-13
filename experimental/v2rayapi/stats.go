@@ -60,6 +60,7 @@ func NewStatsService(options option.V2RayStatsServiceOptions) *StatsService {
 	}
 }
 
+// TODO(mmotyshen): Take a look at this StatsService.
 func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	inbound := metadata.Inbound
 	user := metadata.User
