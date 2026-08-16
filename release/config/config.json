@@ -50,7 +50,7 @@
       "type": "smart",
       "tag": "auto-out",
       "outbounds": ["direct-out", "socks-out"],
-      "required_success_rate": "1m",
+      "required_success_rate": 0.0,
       "recheck_interval": "3m",
       "request_sample_count": 10,
       "required_request_sample_count": 0

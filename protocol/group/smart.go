@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sync"
@@ -199,6 +200,8 @@ type SmartGroup struct {
 	tag       string
 	outbounds []adapter.Outbound
 	cacheFile adapter.CacheFile
+	// TODO(mmotyshen): URLTest fallback is meaningless, because, instead of falling back,
+	// the system must learn until it has enough data to intelligently select outbounds.
 	*URLTestGroup
 	logger         log.Logger
 	learningAccess sync.RWMutex
@@ -325,9 +328,11 @@ func (g *SmartGroup) Select(network string, destination M.Socksaddr) (adapter.Ou
 	if domain == "" {
 		return g.URLTestGroup.Select(network)
 	}
+	// TODO(mmotyshen): the `selected` field should only be used if the recheck period has not yet passed.
 	g.selectedAccess.RLock()
 	sel := g.selected[domain]
 	g.selectedAccess.RUnlock()
+	// TODO(mmotyshen): Maybe, the domain stats must also distinguish between types of networks.
 	if sel != nil && common.Contains(sel.Network(), network) {
 		return sel, true
 	}
@@ -336,10 +341,11 @@ func (g *SmartGroup) Select(network string, destination M.Socksaddr) (adapter.Ou
 		g.setSelected(domain, best)
 		return best, true
 	}
-	for _, o := range g.outbounds {
+	// TODO(mmotyshen): Maybe, select the outbound with the least stats instead of randomly.
+	for _, i := range rand.Perm(len(g.outbounds)) {
+		o := g.outbounds[i]
 		if common.Contains(o.Network(), network) {
-			g.setSelected(domain, o)
-			return o, false
+			return o, false // TODO(mmotyshen): Should it really be `false`, not `true`?
 		}
 	}
 	return nil, false
@@ -348,10 +354,10 @@ func (g *SmartGroup) Select(network string, destination M.Socksaddr) (adapter.Ou
 func (g *SmartGroup) selectBest(domain, network string) adapter.Outbound {
 	g.learningAccess.RLock()
 	domainStats, ok := g.learning[domain]
-	if !ok {
-		panic("todo") // TODO(mmotyshen): handle gracefully.
-	}
 	g.learningAccess.RUnlock()
+	if !ok {
+		return nil
+	}
 	var (
 		best         adapter.Outbound
 		bestDelayAvg float64
@@ -388,11 +394,8 @@ func (g *SmartGroup) selectBest(domain, network string) adapter.Outbound {
 			bestDelayAvg = delayAvg
 		}
 	}
-	if best == nil {
-		o, _ := g.URLTestGroup.Select(network)
-		return o
-	}
-	return best
+
+	return best // nil is allowed.
 }
 
 // TODO(mmotyshen): not used.
@@ -422,6 +425,8 @@ func (g *SmartGroup) setSelected(domain string, out adapter.Outbound) {
 		return
 	}
 	tag := RealTag(out)
+	// TODO(mmotyshen): Recheck time implies that actual metrics were obtained, but current implementation
+	// calls setSelected as a fallback even without any data.
 	g.updateRecheckTime(domain, tag)
 	g.selectedAccess.Lock()
 	g.selected[domain] = out
@@ -442,6 +447,8 @@ func (g *SmartGroup) updateRecheckTime(domain, tag string) {
 	g.learningAccess.Unlock()
 }
 
+// TODO(mmotyshen): This method should not actually do anything
+// unless recheck period has passed since last recheck.
 func (g *SmartGroup) triggerSelectionUpdate(domain, network string) {
 	if domain == "" {
 		return
