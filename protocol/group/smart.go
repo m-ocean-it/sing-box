@@ -136,32 +136,23 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		s.group.Observe(destination, outbound, false, 0)
 		return nil, err
 	}
-	domain := destination.Fqdn
-	s.group.triggerSelectionUpdate(domain, network)
-	conn = newConnObserver(s.group, domain, outbound.Tag(), conn)
+	conn = newConnObserver(s.group, destination.Fqdn, outbound.Tag(), conn)
 	return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 }
 
+// TODO(mmotyshen): this method should probably also return a connection wrapped in observer.
 func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	s.group.Touch()
 	outbound, _ := s.group.Select(N.NetworkUDP, destination)
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
-	domain := destination.Fqdn
 	if err == nil {
 		s.group.Observe(destination, outbound, true, 0)
-		if domain != "" {
-			s.group.triggerSelectionUpdate(domain, N.NetworkUDP)
-		}
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	s.group.Observe(destination, outbound, false, 0)
-	if domain != "" {
-		s.group.triggerSelectionUpdate(domain, N.NetworkUDP)
-	}
 	return nil, err
 }
 
@@ -196,6 +187,11 @@ func (s *Smart) NewDirectRouteConnection(metadata adapter.InboundContext, routeC
 	return selected.(adapter.DirectRouteOutbound).NewDirectRouteConnection(metadata, routeContext, timeout)
 }
 
+type SelectedOutbound struct {
+	Outbound   adapter.Outbound
+	ValidUntil time.Time
+}
+
 type SmartGroup struct {
 	tag       string
 	outbounds []adapter.Outbound
@@ -207,7 +203,7 @@ type SmartGroup struct {
 	learningAccess sync.RWMutex
 	learning       map[string]adapter.SmartDomainStats
 	selectedAccess sync.RWMutex
-	selected       map[string]adapter.Outbound
+	selected       map[string]SelectedOutbound
 	saveAccess     sync.Mutex
 	saveTimer      *time.Timer
 	interruptGroup *interrupt.Group
@@ -252,7 +248,7 @@ func NewSmartGroup(
 		logger:                     logger,
 		URLTestGroup:               urlTestGroup,
 		learning:                   make(map[string]adapter.SmartDomainStats),
-		selected:                   make(map[string]adapter.Outbound),
+		selected:                   make(map[string]SelectedOutbound),
 		interruptGroup:             interrupt.NewGroup(),
 		requestSampleCount:         requestSampleCount,
 		requiredRequestSampleCount: requiredRequestSampleCount,
@@ -272,11 +268,6 @@ func NewSmartGroup(
 		}
 	}
 	return group, nil
-}
-
-func (g *SmartGroup) Touch() {
-	// TODO(mmotyshen): Is this method needed?
-	// TODO(mmotyshen): Maybe, need to touch the embedded urltest group?
 }
 
 func (g *SmartGroup) Close() error {
@@ -330,49 +321,49 @@ func (g *SmartGroup) Select(network string, destination M.Socksaddr) (adapter.Ou
 	}
 	// TODO(mmotyshen): the `selected` field should only be used if the recheck period has not yet passed.
 	g.selectedAccess.RLock()
-	sel := g.selected[domain]
+	sel, ok := g.selected[domain]
 	g.selectedAccess.RUnlock()
+	now := time.Now()
 	// TODO(mmotyshen): Maybe, the domain stats must also distinguish between types of networks.
-	if sel != nil && common.Contains(sel.Network(), network) {
-		return sel, true
+	if ok && sel.ValidUntil.After(now) && common.Contains(sel.Outbound.Network(), network) {
+		return sel.Outbound, true
 	}
-	best := g.selectBest(domain, network)
-	if best != nil {
-		g.setSelected(domain, best)
-		return best, true
+	o, isBest, bestCheckedAt := g.selectOutbound(domain, network)
+	if isBest {
+		g.setSelected(domain, o, bestCheckedAt)
+		return o, true
 	}
-	// TODO(mmotyshen): Maybe, select the outbound with the least stats instead of randomly.
-	for _, i := range rand.Perm(len(g.outbounds)) {
-		o := g.outbounds[i]
-		if common.Contains(o.Network(), network) {
-			return o, false // TODO(mmotyshen): Should it really be `false`, not `true`?
-		}
-	}
-	return nil, false
+	return o, false
 }
 
-func (g *SmartGroup) selectBest(domain, network string) adapter.Outbound {
+func (g *SmartGroup) selectOutbound(
+	domain, network string,
+) (outbound adapter.Outbound, isBest bool, bestCheckedAt time.Time) {
 	g.learningAccess.RLock()
 	domainStats, ok := g.learning[domain]
 	g.learningAccess.RUnlock()
 	if !ok {
-		return nil
+		return g.selectRandomOutbound(network), false, time.Time{}
 	}
 	var (
 		best         adapter.Outbound
 		bestDelayAvg float64
+		now          = time.Now()
 	)
-	for _, detour := range g.outbounds {
-		if !slices.Contains(detour.Network(), network) {
+	for _, i := range rand.Perm(len(g.outbounds)) {
+		outbound := g.outbounds[i]
+		if !slices.Contains(outbound.Network(), network) {
 			continue
 		}
-		outboundStats, ok := domainStats.Outbounds[detour.Tag()]
+		outboundStats, ok := domainStats.Outbounds[outbound.Tag()]
 		if !ok {
-			// TODO(mmotyshen): Make sure to, at some point, collect stats for a new outbound.
-			continue
+			return outbound, false, time.Time{}
+		}
+		if now.Sub(outboundStats.LastRecheckTime) > g.recheckInterval {
+			return outbound, false, time.Time{}
 		}
 		if len(outboundStats.LastRequestResultsRing) < g.requiredRequestSampleCount {
-			continue // Not enough requests collected.
+			return outbound, false, time.Time{}
 		}
 		var (
 			successCount int
@@ -386,16 +377,29 @@ func (g *SmartGroup) selectBest(domain, network string) adapter.Outbound {
 		}
 		successRate := float64(successCount) / float64(len(outboundStats.LastRequestResultsRing))
 		if successRate < g.requiredSuccessRate {
-			continue // Not enough successful requests collected.
+			continue
 		}
 		delayAvg := float64(delaySum) / float64(successCount)
 		if best == nil || delayAvg < bestDelayAvg {
-			best = detour
+			best = outbound
 			bestDelayAvg = delayAvg
+			bestCheckedAt = outboundStats.LastRecheckTime
 		}
 	}
+	if best == nil {
+		return g.selectRandomOutbound(network), false, time.Time{}
+	}
+	return best, true, bestCheckedAt
+}
 
-	return best // nil is allowed.
+func (g *SmartGroup) selectRandomOutbound(network string) adapter.Outbound {
+	for _, i := range rand.Perm(len(g.outbounds)) {
+		outbound := g.outbounds[i]
+		if slices.Contains(outbound.Network(), network) {
+			return outbound
+		}
+	}
+	return nil
 }
 
 // TODO(mmotyshen): not used.
@@ -420,19 +424,25 @@ func (g *SmartGroup) maybeExplore(domain, network string, currentBest adapter.Ou
 	return currentBest
 }
 
-func (g *SmartGroup) setSelected(domain string, out adapter.Outbound) {
-	if out == nil || domain == "" {
+func (g *SmartGroup) setSelected(
+	domain string,
+	outbound adapter.Outbound,
+	checkedAt time.Time,
+) {
+	if outbound == nil || domain == "" {
 		return
 	}
-	tag := RealTag(out)
-	// TODO(mmotyshen): Recheck time implies that actual metrics were obtained, but current implementation
-	// calls setSelected as a fallback even without any data.
+	tag := RealTag(outbound)
 	g.updateRecheckTime(domain, tag)
 	g.selectedAccess.Lock()
-	g.selected[domain] = out
+	g.selected[domain] = SelectedOutbound{
+		Outbound:   outbound,
+		ValidUntil: checkedAt.Add(g.recheckInterval),
+	}
 	g.selectedAccess.Unlock()
 }
 
+// TODO(mmotyshen): Probably, must delete this.
 func (g *SmartGroup) updateRecheckTime(domain, tag string) {
 	now := time.Now()
 	g.learningAccess.Lock()
@@ -447,30 +457,29 @@ func (g *SmartGroup) updateRecheckTime(domain, tag string) {
 	g.learningAccess.Unlock()
 }
 
-// TODO(mmotyshen): This method should not actually do anything
-// unless recheck period has passed since last recheck.
-func (g *SmartGroup) triggerSelectionUpdate(domain, network string) {
-	if domain == "" {
-		return
-	}
-	go func() { // TODO(mmotyshen): allow a single goroutine per domain?
-		best := g.selectBest(domain, network)
-		if best == nil {
-			return
-		}
-		g.selectedAccess.Lock()
-		current := g.selected[domain]
-		changed := current != best
-		if changed {
-			g.selected[domain] = best
-		}
-		g.selectedAccess.Unlock()
-		if changed {
-			g.updateRecheckTime(domain, RealTag(best))
-			g.logger.Debug("smart updated selection: domain=", domain, " outbound=", best.Tag())
-		}
-	}()
-}
+// TODO(mmotyshen): Probably, must delete this.
+// func (g *SmartGroup) triggerSelectionUpdate(domain, network string) {
+// 	if domain == "" {
+// 		return
+// 	}
+// 	go func() { // TODO(mmotyshen): allow a single goroutine per domain?
+// 		best := g.selectBest(domain, network)
+// 		if best == nil {
+// 			return
+// 		}
+// 		g.selectedAccess.Lock()
+// 		current := g.selected[domain]
+// 		changed := current != best
+// 		if changed {
+// 			g.selected[domain] = best
+// 		}
+// 		g.selectedAccess.Unlock()
+// 		if changed {
+// 			g.updateRecheckTime(domain, RealTag(best))
+// 			g.logger.Debug("smart updated selection: domain=", domain, " outbound=", best.Tag())
+// 		}
+// 	}()
+// }
 
 func (g *SmartGroup) scheduleSave() {
 	g.saveAccess.Lock()
