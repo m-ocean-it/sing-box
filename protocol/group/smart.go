@@ -109,22 +109,14 @@ func (s *Smart) Close() error {
 	return common.Close(common.PtrOrNil(s.group))
 }
 
-func (s *Smart) PostStart() error {
-	s.group.URLTestGroup.PostStart()
-	return nil
-}
-
-// Now returns the outbound currently selected by the embedded URLTest group.
 func (s *Smart) Now() string {
-	return s.group.URLTestGroup.Now()
+	return s.group.outbounds[0].Tag()
 }
-
 func (s *Smart) All() []string {
 	return s.tags
 }
 
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	s.group.Touch()
 	var outbound adapter.Outbound
 	switch N.NetworkName(network) {
 	case N.NetworkTCP, N.NetworkUDP:
@@ -172,16 +164,13 @@ func (s *Smart) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, me
 }
 
 func (s *Smart) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
-	if s.group != nil {
-		s.group.Touch()
-	}
 	var selected adapter.Outbound
 	sockAddr := M.ParseSocksaddr(metadata.Domain)
 	if metadata.Domain != "" {
 		selected, _ = s.group.Select(N.NetworkTCP, sockAddr)
 	}
 	if selected == nil {
-		selected, _ = s.group.URLTestGroup.Select(N.NetworkTCP)
+		selected = s.group.outbounds[0]
 	}
 	if selected == nil {
 		return nil, E.New("missing supported outbound")
@@ -198,12 +187,9 @@ type SelectedOutbound struct {
 }
 
 type SmartGroup struct {
-	tag       string
-	outbounds []adapter.Outbound
-	cacheFile adapter.CacheFile
-	// TODO(mmotyshen): URLTest fallback is meaningless, because, instead of falling back,
-	// the system must learn until it has enough data to intelligently select outbounds.
-	*URLTestGroup
+	tag            string
+	outbounds      []adapter.Outbound
+	cacheFile      adapter.CacheFile
 	logger         log.Logger
 	learningAccess sync.RWMutex
 	learning       freelru.Cache[string, *SmartDomainStats]
@@ -242,11 +228,7 @@ func NewSmartGroup(
 	if requiredRequestSampleCount <= 0 || requiredRequestSampleCount > requestSampleCount {
 		requiredRequestSampleCount = 3
 	}
-	urlTestGroup, err := NewURLTestGroup(ctx, outboundManager, logger, outbounds, "", 0, 0, 0, false)
-	if err != nil {
-		return nil, err
-	}
-	learningCache, err := freelru.NewSharded[string, *SmartDomainStats](
+	learningCache, err := freelru.NewSharded[string, *SmartDomainStats]( // TODO(mmotyshen): maybe, not sharded?
 		smartLearningCacheSize,
 		maphash.NewHasher[string]().Hash32,
 	)
@@ -258,7 +240,6 @@ func NewSmartGroup(
 		outbounds:                  outbounds,
 		cacheFile:                  service.FromContext[adapter.CacheFile](ctx),
 		logger:                     logger,
-		URLTestGroup:               urlTestGroup,
 		learning:                   learningCache,
 		selected:                   make(map[string]SelectedOutbound),
 		interruptGroup:             interrupt.NewGroup(),
@@ -342,7 +323,7 @@ func (g *SmartGroup) observe(domain, tag string, success bool, delay time.Durati
 func (g *SmartGroup) Select(network string, destination M.Socksaddr) (adapter.Outbound, bool) {
 	domain := destination.Fqdn
 	if domain == "" {
-		return g.URLTestGroup.Select(network)
+		return g.outbounds[0], false
 	}
 	// TODO(mmotyshen): the `selected` field should only be used if the recheck period has not yet passed.
 	g.selectedAccess.RLock()
@@ -580,7 +561,7 @@ type SmartDomainStats struct {
 
 type SmartOutboundStats struct {
 	RequestResults  *ring.Buffer[SmartRequestResult]
-	LastRecheckTime time.Time
+	LastRecheckTime time.Time // FIXME(mmotyshen): not being set anywhere!
 }
 
 type SmartRequestResult struct {
