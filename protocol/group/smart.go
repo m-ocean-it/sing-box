@@ -113,7 +113,6 @@ func (s *Smart) Now() string {
 	return s.group.URLTestGroup.Now()
 }
 
-// TODO(mmotyshen): Is this method needed?
 func (s *Smart) All() []string {
 	return s.tags
 }
