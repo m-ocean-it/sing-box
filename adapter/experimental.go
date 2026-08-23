@@ -136,19 +136,23 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 	return nil
 }
 
-// TODO(mmotyshen): move struct to somewhere else?
 type SmartRoutingStats struct {
-	StatsByDomains map[string]SmartDomainStats // TODO: limit possible size.
+	// Must be ordered from oldest to newest, such that an LRU structure
+	// is populated correctly upon sequentially reading this data.
+	StatsByDomains []SmartDomainStats
 }
 
 type SmartDomainStats struct {
+	Domain    string
 	Outbounds map[string]SmartOutboundStats
 }
 
 type SmartOutboundStats struct {
-	LastRequestResultsRing       []SmartRequestResult
-	LastRequestResultsRingCursor int
-	LastRecheckTime              time.Time // TODO: masrshal and unmarshal.
+	// Must be ordered from oldest to newest, such that a ring-buffer
+	// is populated correctly upon sequentially reading this data.
+	RequestResults []SmartRequestResult
+
+	LastRecheckTime time.Time // TODO: marshal and unmarshal.
 }
 
 type SmartRequestResult struct {
@@ -166,7 +170,8 @@ func (s *SmartRoutingStats) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	for domain, state := range s.StatsByDomains {
+	for _, domainState := range s.StatsByDomains {
+		domain := domainState.Domain
 		_, err = varbin.WriteUvarint(&buffer, uint64(len(domain)))
 		if err != nil {
 			return nil, err
@@ -175,11 +180,11 @@ func (s *SmartRoutingStats) MarshalBinary() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		_, err = varbin.WriteUvarint(&buffer, uint64(len(state.Outbounds)))
+		_, err = varbin.WriteUvarint(&buffer, uint64(len(domainState.Outbounds)))
 		if err != nil {
 			return nil, err
 		}
-		for tag, stats := range state.Outbounds {
+		for tag, stats := range domainState.Outbounds {
 			_, err = varbin.WriteUvarint(&buffer, uint64(len(tag)))
 			if err != nil {
 				return nil, E.Cause(err, "WriteUvarint length of tag")
@@ -188,27 +193,23 @@ func (s *SmartRoutingStats) MarshalBinary() ([]byte, error) {
 			if err != nil {
 				return nil, E.Cause(err, "WriteString tag")
 			}
-			_, err = varbin.WriteUvarint(&buffer, uint64(len(stats.LastRequestResultsRing)))
+			_, err = varbin.WriteUvarint(&buffer, uint64(len(stats.RequestResults)))
 			if err != nil {
 				return nil, E.Cause(err, "WriteUvarint length of last requests results ring")
 			}
-			for _, requestResult := range stats.LastRequestResultsRing {
+			for _, rr := range stats.RequestResults {
 				var successBit uint8
-				if requestResult.Success {
+				if rr.Success {
 					successBit = 1
 				}
 				err = buffer.WriteByte(successBit)
 				if err != nil {
 					return nil, err
 				}
-				err = binary.Write(&buffer, binary.BigEndian, requestResult.Delay)
+				err = binary.Write(&buffer, binary.BigEndian, rr.Delay)
 				if err != nil {
 					return nil, E.Cause(err, "write delay")
 				}
-			}
-			err = binary.Write(&buffer, binary.BigEndian, stats.LastRequestResultsRingCursor)
-			if err != nil {
-				return nil, E.Cause(err, "write request results ring cursor")
 			}
 		}
 	}
@@ -229,20 +230,21 @@ func (s *SmartRoutingStats) UnmarshalBinary(data []byte) error {
 	if domainCount > uint64(reader.Len()) {
 		return E.New("invalid domain count: ", domainCount)
 	}
-	s.StatsByDomains = make(map[string]SmartDomainStats, domainCount)
+	s.StatsByDomains = make([]SmartDomainStats, domainCount)
 	for range domainCount {
 		domain, err := readVarbinString(reader)
 		if err != nil {
-			return E.Cause(err, "domain name")
+			return E.Cause(err, "read domain name")
 		}
 		outboundCount, err := binary.ReadUvarint(reader)
 		if err != nil {
-			return E.Cause(err, "outbound count")
+			return E.Cause(err, "read outbound count")
 		}
 		if outboundCount > uint64(reader.Len()) {
 			return E.New("invalid outbound count: ", outboundCount)
 		}
 		domainState := SmartDomainStats{
+			Domain:    domain,
 			Outbounds: make(map[string]SmartOutboundStats, outboundCount),
 		}
 		for range outboundCount {
@@ -250,7 +252,6 @@ func (s *SmartRoutingStats) UnmarshalBinary(data []byte) error {
 			if err != nil {
 				return E.Cause(err, "outbound tag")
 			}
-			var stats SmartOutboundStats
 			resultCount, err := binary.ReadUvarint(reader)
 			if err != nil {
 				return E.Cause(err, "request result count")
@@ -258,25 +259,24 @@ func (s *SmartRoutingStats) UnmarshalBinary(data []byte) error {
 			if resultCount > uint64(reader.Len()) {
 				return E.New("invalid request result count: ", resultCount)
 			}
-			stats.LastRequestResultsRing = make([]SmartRequestResult, resultCount)
-			for i := range stats.LastRequestResultsRing {
+			results := make([]SmartRequestResult, resultCount)
+			for i := range results {
 				successBit, err := reader.ReadByte()
 				if err != nil {
 					return E.Cause(err, "request result success bit")
 				}
-				stats.LastRequestResultsRing[i].Success = successBit != 0
-				err = binary.Read(reader, binary.BigEndian, &stats.LastRequestResultsRing[i].Delay)
+				results[i].Success = successBit != 0
+				err = binary.Read(reader, binary.BigEndian, &results[i].Delay)
 				if err != nil {
 					return E.Cause(err, "request result delay")
 				}
 			}
-			err = binary.Read(reader, binary.BigEndian, &stats.LastRequestResultsRingCursor)
-			if err != nil {
-				return E.Cause(err, "read request results ring cursor")
+			domainState.Outbounds[tag] = SmartOutboundStats{
+				RequestResults:  results,
+				LastRecheckTime: time.Time{}, // FIXME(mmotyshen): actually read.
 			}
-			domainState.Outbounds[tag] = stats
 		}
-		s.StatsByDomains[domain] = domainState
+		s.StatsByDomains = append(s.StatsByDomains, domainState)
 	}
 	return nil
 }

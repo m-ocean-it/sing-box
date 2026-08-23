@@ -2,7 +2,6 @@ package group
 
 import (
 	"context"
-	"maps"
 	"math/rand/v2"
 	"net"
 	"slices"
@@ -12,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/ring"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -20,11 +20,17 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/contrab/freelru"
+	"github.com/sagernet/sing/contrab/maphash"
 	"github.com/sagernet/sing/service"
 )
 
 const (
 	smartSaveInterval = 5 * time.Second
+
+	// TODO(mmotyshen): Move to config.
+	// TODO(mmotyshen): Maybe, separate size of `selected` and `learning`.
+	smartLearningCacheSize = 10000 // Hardcoded LRU size for domain learning cache.
 )
 
 func RegisterSmart(registry *outbound.Registry) {
@@ -200,9 +206,9 @@ type SmartGroup struct {
 	*URLTestGroup
 	logger         log.Logger
 	learningAccess sync.RWMutex
-	learning       map[string]adapter.SmartDomainStats
+	learning       freelru.Cache[string, *SmartDomainStats]
 	selectedAccess sync.RWMutex
-	selected       map[string]SelectedOutbound
+	selected       map[string]SelectedOutbound // TODO(mmotyshen): How to limit the size? Maybe, just evict when `learning.Add` returns true.
 	saveAccess     sync.Mutex
 	saveTimer      *time.Timer
 	interruptGroup *interrupt.Group
@@ -240,13 +246,20 @@ func NewSmartGroup(
 	if err != nil {
 		return nil, err
 	}
+	learningCache, err := freelru.NewSharded[string, *SmartDomainStats](
+		smartLearningCacheSize,
+		maphash.NewHasher[string]().Hash32,
+	)
+	if err != nil {
+		return nil, E.Cause(err, "create learning cache")
+	}
 	group := &SmartGroup{
 		tag:                        tag,
 		outbounds:                  outbounds,
 		cacheFile:                  service.FromContext[adapter.CacheFile](ctx),
 		logger:                     logger,
 		URLTestGroup:               urlTestGroup,
-		learning:                   make(map[string]adapter.SmartDomainStats),
+		learning:                   learningCache,
 		selected:                   make(map[string]SelectedOutbound),
 		interruptGroup:             interrupt.NewGroup(),
 		requestSampleCount:         requestSampleCount,
@@ -256,13 +269,27 @@ func NewSmartGroup(
 	}
 	if group.cacheFile != nil {
 		if state := group.cacheFile.LoadSmartRouting(tag); state != nil && len(state.StatsByDomains) > 0 {
-			group.learning = make(map[string]adapter.SmartDomainStats, len(state.StatsByDomains))
-			for d, ds := range state.StatsByDomains {
-				copyDs := adapter.SmartDomainStats{
-					Outbounds: make(map[string]adapter.SmartOutboundStats, len(ds.Outbounds)),
+			for _, cacheDomainStats := range state.StatsByDomains {
+				if cacheDomainStats.Domain == "" {
+					continue // TODO(mmotyshen): log.
 				}
-				maps.Copy(copyDs.Outbounds, ds.Outbounds)
-				group.learning[d] = copyDs
+				outbounds := make(map[string]SmartOutboundStats, len(cacheDomainStats.Outbounds))
+				for tag, stats := range cacheDomainStats.Outbounds {
+					ringBuffer := ring.New[SmartRequestResult](requestSampleCount)
+					for _, rr := range stats.RequestResults {
+						ringBuffer.Push(SmartRequestResult{
+							Success: rr.Success,
+							Delay:   rr.Delay,
+						})
+					}
+					outbounds[tag] = SmartOutboundStats{
+						RequestResults:  ringBuffer,
+						LastRecheckTime: stats.LastRecheckTime,
+					}
+				}
+				group.learning.Add(cacheDomainStats.Domain, &SmartDomainStats{
+					Outbounds: outbounds,
+				})
 			}
 		}
 	}
@@ -290,24 +317,23 @@ func (g *SmartGroup) observe(domain, tag string, success bool, delay time.Durati
 		return
 	}
 	g.learningAccess.Lock()
-	domainState := g.learning[domain]
+	domainState, ok := g.learning.Get(domain)
+	if !ok || domainState == nil {
+		domainState = &SmartDomainStats{
+			Outbounds: make(map[string]SmartOutboundStats),
+		}
+	}
 	if domainState.Outbounds == nil {
-		domainState.Outbounds = make(map[string]adapter.SmartOutboundStats)
+		domainState.Outbounds = make(map[string]SmartOutboundStats)
 	}
 	stats := domainState.Outbounds[tag]
-	maxSamples := max(g.requestSampleCount, 1)
-	result := adapter.SmartRequestResult{Success: success, Delay: delay}
-	// TODO(mmotyshen): extract ring buffer implementation to own package, add tests, then use it here.
-	if len(stats.LastRequestResultsRing) < maxSamples {
-		stats.LastRequestResultsRing = append(stats.LastRequestResultsRing, result)
-		stats.LastRequestResultsRingCursor = len(stats.LastRequestResultsRing)
-	} else {
-		cursor := stats.LastRequestResultsRingCursor % g.requestSampleCount
-		stats.LastRequestResultsRing[cursor] = result
-		stats.LastRequestResultsRingCursor = (cursor + 1) % g.requestSampleCount
+	if stats.RequestResults == nil {
+		stats.RequestResults = ring.New[SmartRequestResult](g.requestSampleCount)
 	}
+	result := SmartRequestResult{Success: success, Delay: delay}
+	stats.RequestResults.Push(result)
 	domainState.Outbounds[tag] = stats
-	g.learning[domain] = domainState
+	g.learning.Add(domain, domainState)
 	g.learningAccess.Unlock()
 	g.logger.Debug("smart observe: domain=", domain, " outbound=", tag, " success=", success, " delay=", delay)
 	g.scheduleSave()
@@ -339,9 +365,9 @@ func (g *SmartGroup) selectOutbound(
 	domain, network string,
 ) (outbound adapter.Outbound, isBest bool, bestCheckedAt time.Time) {
 	g.learningAccess.RLock()
-	domainStats, ok := g.learning[domain]
+	domainStats, ok := g.learning.Get(domain)
 	g.learningAccess.RUnlock()
-	if !ok {
+	if !ok || domainStats == nil {
 		return g.selectRandomOutbound(network), false, time.Time{}
 	}
 	var (
@@ -361,20 +387,20 @@ func (g *SmartGroup) selectOutbound(
 		if now.Sub(outboundStats.LastRecheckTime) > g.recheckInterval {
 			return outbound, false, time.Time{}
 		}
-		if len(outboundStats.LastRequestResultsRing) < g.requiredRequestSampleCount {
+		if outboundStats.RequestResults.Size() < g.requiredRequestSampleCount {
 			return outbound, false, time.Time{}
 		}
 		var (
 			successCount int
 			delaySum     time.Duration
 		)
-		for _, r := range outboundStats.LastRequestResultsRing {
+		for _, r := range outboundStats.RequestResults.Slice() {
 			if r.Success {
 				successCount++
 				delaySum += r.Delay
 			}
 		}
-		successRate := float64(successCount) / float64(len(outboundStats.LastRequestResultsRing))
+		successRate := float64(successCount) / float64(outboundStats.RequestResults.Size())
 		if successRate < g.requiredSuccessRate {
 			continue
 		}
@@ -408,18 +434,20 @@ func (g *SmartGroup) maybeExplore(domain, network string, currentBest adapter.Ou
 	}
 	now := time.Now()
 	g.learningAccess.RLock()
-	ds := g.learning[domain]
+	ds, ok := g.learning.Get(domain)
+	g.learningAccess.RUnlock()
+	if !ok || ds == nil {
+		return currentBest
+	}
 	for _, detour := range g.outbounds {
 		if !common.Contains(detour.Network(), network) || detour == currentBest {
 			continue
 		}
 		st := ds.Outbounds[RealTag(detour)]
 		if now.Sub(st.LastRecheckTime) > g.recheckInterval {
-			g.learningAccess.RUnlock()
 			return detour
 		}
 	}
-	g.learningAccess.RUnlock()
 	return currentBest
 }
 
@@ -445,14 +473,19 @@ func (g *SmartGroup) setSelected(
 func (g *SmartGroup) updateRecheckTime(domain, tag string) {
 	now := time.Now()
 	g.learningAccess.Lock()
-	ds := g.learning[domain]
+	ds, ok := g.learning.Get(domain)
+	if !ok || ds == nil {
+		ds = &SmartDomainStats{
+			Outbounds: make(map[string]SmartOutboundStats),
+		}
+	}
 	if ds.Outbounds == nil {
-		ds.Outbounds = make(map[string]adapter.SmartOutboundStats)
+		ds.Outbounds = make(map[string]SmartOutboundStats)
 	}
 	st := ds.Outbounds[tag]
 	st.LastRecheckTime = now
 	ds.Outbounds[tag] = st
-	g.learning[domain] = ds
+	g.learning.Add(domain, ds)
 	g.learningAccess.Unlock()
 }
 
@@ -504,20 +537,53 @@ func (g *SmartGroup) save() {
 		return
 	}
 	g.learningAccess.RLock()
-	state := &adapter.SmartRoutingStats{
-		StatsByDomains: make(map[string]adapter.SmartDomainStats, len(g.learning)),
+	cacheState := &adapter.SmartRoutingStats{
+		StatsByDomains: make([]adapter.SmartDomainStats, g.learning.Len()),
 	}
-	for domain, domainStats := range g.learning {
-		copyState := adapter.SmartDomainStats{
-			Outbounds: make(map[string]adapter.SmartOutboundStats, len(domainStats.Outbounds)),
+	for _, domain := range g.learning.Keys() {
+		if domainStats, ok := g.learning.Peek(domain); ok && domainStats != nil {
+			cacheDomainState := adapter.SmartDomainStats{
+				Domain:    domain,
+				Outbounds: make(map[string]adapter.SmartOutboundStats, len(domainStats.Outbounds)),
+			}
+			for outbound, outboundStats := range domainStats.Outbounds {
+				resultsToStore := make([]adapter.SmartRequestResult, 0, outboundStats.RequestResults.Size())
+				for _, rr := range outboundStats.RequestResults.Slice() {
+					resultsToStore = append(resultsToStore, adapter.SmartRequestResult{
+						Success: rr.Success,
+						Delay:   rr.Delay,
+					})
+				}
+				cacheDomainState.Outbounds[outbound] = adapter.SmartOutboundStats{
+					RequestResults:  resultsToStore,
+					LastRecheckTime: outboundStats.LastRecheckTime,
+				}
+			}
+			cacheState.StatsByDomains = append(cacheState.StatsByDomains, cacheDomainState)
 		}
-		maps.Copy(copyState.Outbounds, domainStats.Outbounds)
-		state.StatsByDomains[domain] = copyState
 	}
 	g.learningAccess.RUnlock()
-	if err := cacheFile.StoreSmartRouting(g.tag, state); err != nil {
+	if err := cacheFile.StoreSmartRouting(g.tag, cacheState); err != nil {
 		g.logger.Warn("save smart routing: ", err)
 	} else {
-		g.logger.Debug("smart saved domains: ", len(state.StatsByDomains))
+		g.logger.Debug("smart saved domains: ", len(cacheState.StatsByDomains))
 	}
+}
+
+type SmartRoutingStats struct {
+	StatsByDomains freelru.ShardedLRU[string, *SmartDomainStats]
+}
+
+type SmartDomainStats struct {
+	Outbounds map[string]SmartOutboundStats
+}
+
+type SmartOutboundStats struct {
+	RequestResults  *ring.Buffer[SmartRequestResult]
+	LastRecheckTime time.Time
+}
+
+type SmartRequestResult struct {
+	Success bool
+	Delay   time.Duration
 }
